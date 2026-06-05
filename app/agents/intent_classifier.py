@@ -8,9 +8,22 @@ Recognised intents: general_chat | refactoring | debugging | explanation | metad
 """
 
 import logging
+from dataclasses import dataclass
+from typing import Optional
 from sentence_transformers import SentenceTransformer, util
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ClassificationDecision:
+    intent: str
+    confidence: float
+    runner_up_intent: Optional[str] = None
+    runner_up_confidence: float = 0.0
+    needs_clarification: bool = False
+    clarification_message: Optional[str] = None
+    source: str = "semantic"
 
 # ── Intent definitions ────────────────────────────────────────────────────────
 # More example phrases per intent = better accuracy.
@@ -89,28 +102,47 @@ class IntentClassifier:
         }
         logger.info("Intent classifier ready.")
 
-    def classify(self, user_prompt: str, threshold: float = 0.35) -> str:
-        """
-        Returns the best-matching intent label.
-        Falls back to 'general_chat' when confidence is below threshold.
+    def classify(self, user_prompt: str, threshold: float = 0.7, gap_threshold: float = 0.15) -> ClassificationDecision:
+        """Return the best intent plus confidence metadata.
+
+        If confidence is low or the top-two gap is too small, return a clarification
+        decision instead of guessing.
         """
         prompt_emb = self._model.encode(user_prompt, convert_to_tensor=True)
 
-        best_intent = "general_chat"
-        best_score  = -1.0
-
+        scored: list[tuple[str, float]] = []
         for intent, embeddings in self._intent_embeddings.items():
-            max_score = float(util.cos_sim(prompt_emb, embeddings).max())
-            if max_score > best_score:
-                best_score  = max_score
-                best_intent = intent
+            scored.append((intent, float(util.cos_sim(prompt_emb, embeddings).max())))
 
-        if best_score < threshold:
-            logger.debug("Low confidence (%.3f) — defaulting to 'general_chat'", best_score)
-            return "general_chat"
+        scored.sort(key=lambda item: item[1], reverse=True)
+        best_intent, best_score = scored[0]
+        runner_up_intent, runner_up_score = scored[1] if len(scored) > 1 else (None, 0.0)
+        score_gap = best_score - runner_up_score
 
-        logger.debug("Intent='%s' (score=%.3f)", best_intent, best_score)
-        return best_intent
+        if best_score >= threshold and score_gap >= gap_threshold:
+            logger.debug("Intent='%s' (score=%.3f, gap=%.3f)", best_intent, best_score, score_gap)
+            return ClassificationDecision(
+                intent=best_intent,
+                confidence=best_score,
+                runner_up_intent=runner_up_intent,
+                runner_up_confidence=runner_up_score,
+                source="semantic",
+            )
+
+        clarification = (
+            "I'm not quite sure I caught that. "
+            "Did you want to look at your dashboard or adjust your settings?"
+        )
+        logger.debug("Low confidence (score=%.3f, gap=%.3f) — asking for clarification", best_score, score_gap)
+        return ClassificationDecision(
+            intent="clarification",
+            confidence=best_score,
+            runner_up_intent=runner_up_intent,
+            runner_up_confidence=runner_up_score,
+            needs_clarification=True,
+            clarification_message=clarification,
+            source="semantic_low_confidence",
+        )
 
 
 # Singleton — loaded once at startup, shared across all requests

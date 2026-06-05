@@ -7,10 +7,11 @@ have multi-turn context. Thread-safe for FastAPI's async workers.
 Swap `_store` for Redis or a DB-backed store for multi-process deployments.
 """
 
-import threading
+import hashlib
 import logging
-from collections import deque
-from typing import Optional
+import threading
+from collections import OrderedDict, deque
+from typing import Any, Optional
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -71,5 +72,40 @@ class MemoryStore:
         ]
 
 
+class PromptCache:
+    """Tiny in-memory LRU cache for prompt classification results."""
+
+    def __init__(self, max_size: int = 1024):
+        self._max_size = max_size
+        self._lock = threading.Lock()
+        self._store: OrderedDict[str, Any] = OrderedDict()
+
+    @staticmethod
+    def _normalize(prompt: str) -> str:
+        return " ".join(prompt.strip().lower().split())
+
+    @classmethod
+    def _key(cls, prompt: str) -> str:
+        normalized = cls._normalize(prompt)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def get(self, prompt: str) -> Any:
+        key = self._key(prompt)
+        with self._lock:
+            value = self._store.get(key)
+            if value is not None:
+                self._store.move_to_end(key)
+            return value
+
+    def set(self, prompt: str, value: Any) -> None:
+        key = self._key(prompt)
+        with self._lock:
+            self._store[key] = value
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_size:
+                self._store.popitem(last=False)
+
+
 # Singleton
 memory_store = MemoryStore()
+prompt_cache = PromptCache()

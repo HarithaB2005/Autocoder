@@ -80,6 +80,12 @@ class CodeResponse(BaseModel):
     agent_used:    str
     model_used:    str
 
+    needs_clarification: bool = False
+    clarification_message: Optional[str] = None
+    classification_confidence: Optional[float] = None
+    classification_gap: Optional[float] = None
+    classification_source: Optional[str] = None
+
     # Exactly what was sent to the GPU — transparent to the caller
     max_tokens_used:  int
     temperature_used: float

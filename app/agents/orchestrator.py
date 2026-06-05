@@ -79,9 +79,34 @@ class Orchestrator:
 
         # ── Step 2: intent classification ─────────────────────────────────────
         log("info", "Classifying intent via CPU semantic model...")
-        intent = classifier.classify(prompt)
-        session.last_intent = intent
-        log("info", f"Intent detected: {intent.upper()}")
+        decision = classifier.classify(prompt)
+        session.last_intent = decision.intent
+
+        if decision.needs_clarification:
+            log("warning", "Low confidence intent classification; returning clarification prompt.")
+            session.add("user", prompt)
+            session.add("assistant", decision.clarification_message or "I'm not sure what you meant.")
+            return CodeResponse(
+                session_id=sid,
+                intent=decision.intent,
+                agent_used="clarification",
+                model_used="none",
+                needs_clarification=True,
+                clarification_message=decision.clarification_message,
+                classification_confidence=decision.confidence,
+                classification_gap=decision.confidence - decision.runner_up_confidence,
+                classification_source=decision.source,
+                max_tokens_used=0,
+                temperature_used=0.0,
+                temperature_bounds="[0.0 – 0.0]",
+                validation_attempts=0,
+                result=decision.clarification_message or "I'm not sure what you meant.",
+                steps=steps,
+                saved_to=None,
+            )
+
+        intent = decision.intent
+        log("info", f"Intent detected: {intent.upper()} (score={decision.confidence:.3f})")
 
         # ── Step 3: build enriched prompt ─────────────────────────────────────
         history  = session.get_context()
@@ -153,6 +178,11 @@ class Orchestrator:
             intent=intent,
             agent_used=agent.name,
             model_used=agent.model,
+            needs_clarification=False,
+            clarification_message=None,
+            classification_confidence=decision.confidence,
+            classification_gap=decision.confidence - decision.runner_up_confidence,
+            classification_source=decision.source,
             max_tokens_used=tokens_used,
             temperature_used=temp_used,
             temperature_bounds=temp_bounds,
