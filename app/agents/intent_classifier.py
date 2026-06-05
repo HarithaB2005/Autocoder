@@ -8,8 +8,22 @@ Recognised intents: general_chat | refactoring | debugging | explanation | metad
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
+
+# ── Fix 1: Force CPU — avoids CUDA driver version mismatch warning/crash ──────
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+# ── Fix 2: Redirect HuggingFace cache to a writable directory ─────────────────
+# The default cache path (/apps/tmp or similar) may not be writable.
+# Use ~/.cache/huggingface which is always writable, or a project-local dir.
+_HF_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+os.environ.setdefault("HF_HOME", _HF_CACHE)
+os.environ.setdefault("TRANSFORMERS_CACHE", os.path.join(_HF_CACHE, "hub"))
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", os.path.join(_HF_CACHE, "sentence_transformers"))
+os.makedirs(_HF_CACHE, exist_ok=True)
+
 from sentence_transformers import SentenceTransformer, util
 
 logger = logging.getLogger(__name__)
@@ -93,7 +107,9 @@ INTENT_DEFINITIONS: dict[str, list[str]] = {
 class IntentClassifier:
     def __init__(self):
         logger.info("Loading intent classifier model (all-MiniLM-L6-v2)...")
-        self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        # Fix 1: Explicitly pass device="cpu" — prevents torch from attempting
+        # CUDA initialisation with an incompatible driver.
+        self._model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
         # Pre-compute embeddings once at startup
         self._intent_embeddings = {

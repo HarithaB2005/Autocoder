@@ -1,15 +1,18 @@
 """
 GPU Model Registry
 ==================
-Swap the placeholder URLs/keys below with your real vLLM / TGI / Ollama endpoints.
-Everything else (retries, timeouts, per-model defaults) is handled automatically.
+Endpoints and model names are configured via environment variables (.env file).
+Each model has its own URL env var since you have separate endpoints per model.
 
-To add a new model:
-    1. Add an entry to MODELS dict below.
-    2. Reference the model name in agents.py.
-    Done.
+Set these in your .env:
+    GPU_URL_QWEN=https://...
+    GPU_URL_LLAMA=https://...
+    GPU_URL_GEMMA=https://...
+    GPU_DEPARTMENT=your-department-value
+    GPU_ENV=prod
 """
 
+import os
 import time
 import logging
 import requests
@@ -19,52 +22,33 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🔧  CONFIGURE YOUR GPU ENDPOINTS HERE
-# ─────────────────────────────────────────────────────────────────────────────
 MODELS: dict = {
     "qwen-coder-32b": {
-        "url":         "http://YOUR_GPU_NODE_1_IP:8000/v1/completions",
-        "api_key":     "YOUR_API_KEY_HERE",
-        # Best for code generation: precise, high-token output
+        "url":         os.environ.get("GPU_URL_QWEN", ""),
+        "model_name":  "qwen-text",
         "max_tokens":  4096,
         "temperature": 0.15,
     },
     "llama-3-70b": {
-        "url":         "http://YOUR_GPU_NODE_2_IP:8000/v1/completions",
-        "api_key":     "YOUR_API_KEY_HERE",
-        # Best for debugging / refactoring: focused, low hallucination
+        "url":         os.environ.get("GPU_URL_LLAMA", ""),
+        "model_name":  "llama-text",
         "max_tokens":  3072,
         "temperature": 0.2,
     },
     "gemma-2-9b": {
-        "url":         "http://YOUR_GPU_NODE_3_IP:8000/v1/completions",
-        "api_key":     "YOUR_API_KEY_HERE",
-        # Best for explanation / validation / metadata: balanced
+        "url":         os.environ.get("GPU_URL_GEMMA", ""),
+        "model_name":  "gemma-text",
         "max_tokens":  2048,
         "temperature": 0.3,
     },
 }
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class GPUModelRegistry:
-    """
-    Thread-safe, retry-aware client for your GPU inference cluster.
-
-    Call signature:
-        registry.generate(
-            model_name  = "qwen-coder-32b",
-            prompt      = "...",
-            max_tokens  = None,   # None → uses model default
-            temperature = None,   # None → uses model default
-        )
-    """
 
     def __init__(self):
         self._models = MODELS
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._department = os.environ.get("GPU_DEPARTMENT", "YOUR_DEPARTMENT_HERE")
 
     def generate(
         self,
@@ -73,32 +57,22 @@ class GPUModelRegistry:
         max_tokens:  Optional[int]   = None,
         temperature: Optional[float] = None,
     ) -> str:
-        """
-        Call the GPU endpoint and return the generated text.
-        Falls back to a clearly labelled placeholder when the URL is still
-        the default placeholder string — so the app runs end-to-end in demo mode.
-        """
         cfg = self._get_config(model_name)
 
         final_max_tokens  = max_tokens  if max_tokens  is not None else cfg["max_tokens"]
         final_temperature = temperature if temperature is not None else cfg["temperature"]
 
-        # ── Demo / placeholder mode ───────────────────────────────────────────
-        if "YOUR_GPU_NODE" in cfg["url"]:
+        if not cfg["url"]:
             logger.warning(
-                "[DEMO] Model '%s' has no real endpoint configured — "
-                "returning placeholder response.",
-                model_name,
+                "[DEMO] Model '%s' has no URL configured — set GPU_URL_%s in your .env file.",
+                model_name, model_name.upper().replace("-", "_"),
             )
             return self._demo_response(model_name, final_max_tokens, final_temperature)
 
-        # ── Real GPU call ─────────────────────────────────────────────────────
         return self._call_with_retry(cfg, model_name, prompt, final_max_tokens, final_temperature)
 
     def list_models(self) -> list[str]:
         return list(self._models.keys())
-
-    # ── Private helpers ───────────────────────────────────────────────────────
 
     def _get_config(self, model_name: str) -> dict:
         if model_name not in self._models:
@@ -110,27 +84,21 @@ class GPUModelRegistry:
 
     def _call_with_retry(
         self,
-        cfg:         dict,
-        model_name:  str,
-        prompt:      str,
-        max_tokens:  int,
-        temperature: float,
-        max_attempts: int = 3,
-        backoff:     float = 2.0,
+        cfg:          dict,
+        model_name:   str,
+        prompt:       str,
+        max_tokens:   int,
+        temperature:  float,
+        max_attempts: int   = 3,
+        backoff:      float = 2.0,
     ) -> str:
-        """
-        HTTP POST with exponential backoff.
-        Raises RuntimeError after all attempts are exhausted.
-        """
-        headers = {
-            "Authorization": f"Bearer {cfg['api_key']}",
-            "Content-Type":  "application/json",
-        }
         payload = {
-            "model":       model_name,
-            "prompt":      prompt,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
+            "prompt":        prompt,
+            "model":         cfg["model_name"],
+            "max_new_token": max_tokens,
+            "temperature":   temperature,
+            "department":    self._department,
+            "env":           os.environ.get("GPU_ENV", "prod"),
         }
 
         last_error: Exception = Exception("Unknown")
@@ -138,12 +106,18 @@ class GPUModelRegistry:
             try:
                 resp = requests.post(
                     cfg["url"],
-                    headers=headers,
-                    json=payload,
+                    data=payload,
                     timeout=settings.DEFAULT_TIMEOUT_SECONDS,
                 )
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["text"].strip()
+
+                result = resp.json()
+                return (
+                    result.get("generated_text")
+                    or result.get("response")
+                    or result.get("text")
+                    or str(result)
+                ).strip()
 
             except requests.exceptions.Timeout as e:
                 last_error = e
@@ -167,13 +141,11 @@ class GPUModelRegistry:
 
     @staticmethod
     def _demo_response(model_name: str, max_tokens: int, temperature: float) -> str:
-        time.sleep(0.3)  # Tiny artificial delay so UI feels realistic
+        time.sleep(0.3)
         return (
             f"# [PLACEHOLDER — {model_name}]\n"
-            f"# max_tokens={max_tokens}  temperature={temperature}\n"
-            f"# Replace the URL in app/core/llm_registry.py with your GPU endpoint.\n\n"
+            f"# Set GPU_URL_QWEN / GPU_URL_LLAMA / GPU_URL_GEMMA in your .env file.\n\n"
             f"def placeholder_function():\n"
-            f"    \"\"\"Generated by {model_name} (demo mode).\"\"\"\n"
             f"    pass\n"
         )
 

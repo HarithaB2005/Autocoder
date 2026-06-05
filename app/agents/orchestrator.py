@@ -17,6 +17,7 @@ temperature=1.8 to the code generator.
 import os
 import uuid
 import logging
+from pathlib import Path
 from typing import Optional
 
 from app.core.config import settings
@@ -212,17 +213,21 @@ class Orchestrator:
     @staticmethod
     def _save(code: str, file_name: Optional[str]) -> Optional[str]:
         try:
-            save_dir = settings.AUTO_SAVE_DIR
-            os.makedirs(save_dir, exist_ok=True)
+            save_dir = Path(settings.AUTO_SAVE_DIR)
+            if not save_dir.is_absolute():
+                save_dir = Path(__file__).resolve().parents[2] / save_dir
+            save_dir.mkdir(parents=True, exist_ok=True)
+
             if file_name:
-                name, ext = os.path.splitext(file_name)
-                out_name  = f"{name}_modified{ext}"
+                source_name = Path(file_name).name
+                name, ext = os.path.splitext(source_name)
+                out_name = f"{name}_modified{ext}"
             else:
                 out_name = "generated_code.py"
-            out_path = os.path.join(save_dir, out_name)
-            with open(out_path, "w", encoding="utf-8") as f:
+            out_path = save_dir / out_name
+            with out_path.open("w", encoding="utf-8") as f:
                 f.write(code)
-            return out_path
+            return str(out_path)
         except Exception as e:
             logger.warning("Auto-save failed: %s", e)
             return None
