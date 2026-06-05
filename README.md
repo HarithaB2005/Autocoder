@@ -4,17 +4,6 @@ Middleware-driven, multi-agent code generation system.
 Converted from Streamlit → production-grade FastAPI REST API.
 
 ---
-import os
-_HF_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-os.environ["HF_HOME"]                   = _HF_CACHE
-os.environ["TRANSFORMERS_CACHE"]        = os.path.join(_HF_CACHE, "hub")
-os.environ["HUGGINGFACE_HUB_CACHE"]     = os.path.join(_HF_CACHE, "hub")
-os.environ["SENTENCE_TRANSFORMERS_HOME"]= os.path.join(_HF_CACHE, "sentence_transformers")
-os.environ["HF_DATASETS_CACHE"]         = os.path.join(_HF_CACHE, "datasets")
-os.environ["CUDA_VISIBLE_DEVICES"]      = ""
-os.makedirs(os.path.join(_HF_CACHE, "hub"), exist_ok=True)
-os.makedirs(os.path.join(_HF_CACHE, "sentence_transformers"), exist_ok=True)
-os.makedirs(os.path.join(_HF_CACHE, "datasets"), exist_ok=True)
 
 ## Architecture
 
