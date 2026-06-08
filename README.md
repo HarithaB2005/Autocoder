@@ -3,8 +3,6 @@
 Middleware-driven, multi-agent code generation system.  
 Converted from Streamlit → production-grade FastAPI REST API.
 
----
-
 ## Architecture
 
 ```
