@@ -118,11 +118,22 @@ class IntentClassifier:
         }
         logger.info("Intent classifier ready.")
 
-    def classify(self, user_prompt: str, threshold: float = 0.7, gap_threshold: float = 0.15) -> ClassificationDecision:
-        """Return the best intent plus confidence metadata.
+    def classify(
+        self,
+        user_prompt:   str,
+        has_file:      bool  = False,
+        threshold:     float = 0.45,
+        gap_threshold: float = 0.05,
+    ) -> ClassificationDecision:
+        """
+        Classify user intent using semantic similarity.
 
-        If confidence is low or the top-two gap is too small, return a clarification
-        decision instead of guessing.
+        Args:
+            user_prompt:   The user's raw message.
+            has_file:      True if the request includes an uploaded file.
+                           Prevents routing to general_chat when code is attached.
+            threshold:     Minimum cosine similarity to accept a classification.
+            gap_threshold: Minimum gap between top-2 scores to avoid ambiguity.
         """
         prompt_emb = self._model.encode(user_prompt, convert_to_tensor=True)
 
@@ -135,6 +146,20 @@ class IntentClassifier:
         runner_up_intent, runner_up_score = scored[1] if len(scored) > 1 else (None, 0.0)
         score_gap = best_score - runner_up_score
 
+        # ── File attachment re-routing ────────────────────────────────────────
+        # If a file is attached and top intent is general_chat, it almost
+        # certainly means the user wants to do something with the code.
+        # Re-route to the highest-scoring code intent instead.
+        if has_file and best_intent == "general_chat":
+            code_intents = {"debugging", "refactoring", "explanation", "generation", "metadata_extraction"}
+            for intent, score in scored:
+                if intent in code_intents:
+                    best_intent   = intent
+                    best_score    = score
+                    score_gap     = best_score - runner_up_score
+                    break
+
+        # ── High confidence: return immediately ───────────────────────────────
         if best_score >= threshold and score_gap >= gap_threshold:
             logger.debug("Intent='%s' (score=%.3f, gap=%.3f)", best_intent, best_score, score_gap)
             return ClassificationDecision(
@@ -145,10 +170,8 @@ class IntentClassifier:
                 source="semantic",
             )
 
-        clarification = (
-            "I'm not quite sure I caught that. "
-            "Did you want to look at your dashboard or adjust your settings?"
-        )
+        # ── Low confidence: ask intelligent clarification ─────────────────────
+        clarification = self._build_clarification(user_prompt, scored, has_file)
         logger.debug("Low confidence (score=%.3f, gap=%.3f) — asking for clarification", best_score, score_gap)
         return ClassificationDecision(
             intent="clarification",
@@ -158,6 +181,44 @@ class IntentClassifier:
             needs_clarification=True,
             clarification_message=clarification,
             source="semantic_low_confidence",
+        )
+
+    def _build_clarification(
+        self,
+        user_prompt: str,
+        scored:      list[tuple[str, float]],
+        has_file:    bool = False,
+    ) -> str:
+        """Generate a context-aware clarification question from the top intent scores."""
+        top_intents = [intent for intent, score in scored[:3] if score > 0.2]
+
+        _labels = {
+            "general_chat":        "just have a general chat",
+            "refactoring":         "refactor or clean up existing code",
+            "debugging":           "debug or fix an error",
+            "explanation":         "get an explanation of how something works",
+            "metadata_extraction": "extract metadata or dependencies from a project",
+            "generation":          "generate new code from scratch",
+        }
+
+        file_hint    = "I can see you've attached a file. " if has_file else ""
+        prompt_lower = user_prompt.lower()
+
+        code_words = {"code","function","class","error","bug","script","file","write","create","build","make","fix","run","test"}
+        if any(w in prompt_lower for w in code_words):
+            options = [_labels[i] for i in top_intents if i != "general_chat" and i in _labels]
+            if options:
+                opts_str = " or ".join(f'"{o}"' for o in options[:2])
+                return f"{file_hint}Did you want to {opts_str}? A bit more detail would help!"
+
+        if top_intents:
+            options = [_labels[i] for i in top_intents if i in _labels]
+            opts_str = " or ".join(f'"{o}"' for o in options[:2])
+            return f"{file_hint}I'm not sure what you need. Did you want to {opts_str}?"
+
+        return (
+            f"{file_hint}Could you describe what you'd like help with? "
+            "For example: generating code, debugging an error, refactoring, or explaining how something works."
         )
 
 

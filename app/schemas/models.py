@@ -27,7 +27,7 @@ class CodeRequest(BaseModel):
     )
     file_content: Optional[str] = Field(
         None,
-        max_length=500_000,   # ~500 KB of source — beyond this, chunk it
+        max_length=500_000,
         description="Optional source file content for the agents to operate on.",
     )
     file_name: Optional[str] = Field(
@@ -41,10 +41,6 @@ class CodeRequest(BaseModel):
         max_length=128,
         description="Session ID for multi-turn memory. Omit to start a new session.",
     )
-
-    # ── Token override ────────────────────────────────────────────────────────
-    # Clients may request fewer tokens than the model default (e.g. for speed).
-    # They may NOT exceed MAX_TOKENS_CEILING (32,768) — enforced here AND in the orchestrator.
     max_tokens: Optional[int] = Field(
         None,
         ge=64,
@@ -54,13 +50,10 @@ class CodeRequest(BaseModel):
             "Range: 64–32,768. Defaults to the model's own tuned default."
         ),
     )
-
-    # ── Retry override ────────────────────────────────────────────────────────
-    # Hard ceiling is 7 — beyond that the cost/benefit is negative.
     validation_max_retries: Optional[int] = Field(
         None,
         ge=0,
-        le=7,   # HARD CEILING — matches VALIDATION_MAX_RETRIES_CEILING in config
+        le=7,
         description=(
             "How many self-correction loops to allow for this request. "
             "Range: 0 (skip validation) – 7. Defaults to server setting (3)."
@@ -75,26 +68,30 @@ class PipelineStep(BaseModel):
     message: str
 
 class CodeResponse(BaseModel):
-    session_id:    str
-    intent:        str
-    agent_used:    str
-    model_used:    str
+    session_id:  str
+    intent:      str
+    agent_used:  str
+    model_used:  str
 
-    needs_clarification: bool = False
-    clarification_message: Optional[str] = None
+    needs_clarification:       bool            = False
+    clarification_message:     Optional[str]   = None
     classification_confidence: Optional[float] = None
-    classification_gap: Optional[float] = None
-    classification_source: Optional[str] = None
+    classification_gap:        Optional[float] = None
+    classification_source:     Optional[str]   = None
 
-    # Exactly what was sent to the GPU — transparent to the caller
-    max_tokens_used:  int
-    temperature_used: float
-    temperature_bounds: str   # e.g. "[0.0 – 0.3]" — tells client why their value was clamped
+    max_tokens_used:   int
+    temperature_used:  float
+    temperature_bounds: str
 
-    validation_attempts: int = 0
-    result:        str
-    steps:         List[PipelineStep]
-    saved_to:      Optional[str] = None
+    validation_attempts: int            = 0
+    validation_score:    Optional[float] = Field(
+        None,
+        description="Final weighted validation score (0.0–1.0). None if validation was skipped."
+    )
+
+    result:   str
+    steps:    List[PipelineStep]
+    saved_to: Optional[str] = None
 
 
 # ─── Session ──────────────────────────────────────────────────────────────────
@@ -106,4 +103,3 @@ class SessionInfo(BaseModel):
 
 class SessionList(BaseModel):
     sessions: List[SessionInfo]
-

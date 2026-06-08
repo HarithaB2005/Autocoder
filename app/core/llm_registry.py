@@ -22,32 +22,38 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
-MODELS: dict = {
-    "qwen-coder-32b": {
-        "url":         os.environ.get("GPU_URL_QWEN", ""),
-        "model_name":  "qwen-text",
-        "max_tokens":  4096,
-        "temperature": 0.15,
-    },
-    "llama-3-70b": {
-        "url":         os.environ.get("GPU_URL_LLAMA", ""),
-        "model_name":  "llama-text",
-        "max_tokens":  3072,
-        "temperature": 0.2,
-    },
-    "gemma-2-9b": {
-        "url":         os.environ.get("GPU_URL_GEMMA", ""),
-        "model_name":  "gemma-text",
-        "max_tokens":  2048,
-        "temperature": 0.3,
-    },
-}
+
 
 
 class GPUModelRegistry:
 
     def __init__(self):
-        self._models = MODELS
+        # URLs resolved HERE not at module level — ensures .env is already loaded
+        # by python-dotenv/pydantic-settings before we read env vars.
+        # Priority: model-specific var → shared GPU_URL → empty (demo mode)
+        def _url(specific: str) -> str:
+            return os.environ.get(specific) or os.environ.get("GPU_URL", "")
+
+        self._models = {
+            "qwen-coder-32b": {
+                "url":         _url("GPU_URL_QWEN"),
+                "model_name":  "qwen-text",
+                "max_tokens":  4096,
+                "temperature": 0.15,
+            },
+            "llama-3-70b": {
+                "url":         _url("GPU_URL_LLAMA"),
+                "model_name":  "llama-text",
+                "max_tokens":  3072,
+                "temperature": 0.2,
+            },
+            "gemma-2-9b": {
+                "url":         _url("GPU_URL_GEMMA"),
+                "model_name":  "gemma-text",
+                "max_tokens":  2048,
+                "temperature": 0.3,
+            },
+        }
         self._department = os.environ.get("GPU_DEPARTMENT", "YOUR_DEPARTMENT_HERE")
 
     def generate(
