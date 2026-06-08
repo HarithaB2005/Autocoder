@@ -18,10 +18,14 @@ from typing import Optional
 
 from app.core.config import settings
 from app.core.llm_registry import registry
-from app.agents.agents import AGENT_REGISTRY, VALIDATION_AGENT, is_gibberish
+from app.agents.agents import (
+    AGENT_REGISTRY, VALIDATION_AGENT, is_gibberish,
+    template_parser, field_extraction_agent, value_cleaner,
+    cross_checker, field_extraction_validator,
+)
 from app.agents.intent_classifier import classifier
 from app.agents.memory import memory_store
-from app.schemas.models import PipelineStep, CodeResponse
+from app.schemas.models import PipelineStep, CodeResponse, FieldResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,8 @@ class Orchestrator:
         prompt:                 str,
         file_content:           Optional[str] = None,
         file_name:              Optional[str] = None,
+        template_content:       Optional[str] = None,
+        template_name:          Optional[str] = None,
         session_id:             Optional[str] = None,
         max_tokens:             Optional[int] = None,
         validation_max_retries: Optional[int] = None,
@@ -95,6 +101,16 @@ class Orchestrator:
                 )
             log("info", "File content validated — readable text confirmed.")
 
+        # Gibberish check on template too
+        if template_content and template_name:
+            log("info", f"Template received: {template_name} ({len(template_content):,} chars)")
+            gibberish, reason = is_gibberish(template_content)
+            if gibberish:
+                log("error", f"Gibberish template rejected: {reason}")
+                return error_response(
+                    f"The template file '{template_name}' doesn't appear to contain readable text."
+                )
+
         # ── Step 2: Intent classification ─────────────────────────────────────
         log("info", "Classifying intent...")
         decision = classifier.classify(prompt, has_file=bool(file_content))
@@ -126,6 +142,21 @@ class Orchestrator:
 
         intent = decision.intent
         log("info", f"Intent: {intent.upper()} (confidence={decision.confidence:.3f}, source={decision.source})")
+
+        # ── FIELD EXTRACTION PIPELINE ─────────────────────────────────────────
+        if intent == "field_extraction":
+            return self._run_field_extraction(
+                prompt=prompt,
+                file_content=file_content or "",
+                file_name=file_name or "document.txt",
+                template_content=template_content or "",
+                template_name=template_name or "template.txt",
+                session=session,
+                sid=sid,
+                steps=steps,
+                decision=decision,
+            )
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Step 3: Build enriched prompt ─────────────────────────────────────
         history  = session.get_context()
@@ -249,12 +280,185 @@ class Orchestrator:
             "debugging":           "Debug and fix the code above:",
             "explanation":         "Explain the following:",
             "metadata_extraction": "Extract structured metadata from the above code:",
+            "field_extraction":    "Extract fields and fill the template:",
             "general_chat":        "User message:",
         }
         frame = task_frames.get(intent, "Task:")
         parts.append(f"[{frame}]\n{user_prompt}")
 
         return "\n".join(parts)
+
+    def _run_field_extraction(
+        self,
+        prompt:           str,
+        file_content:     str,
+        file_name:        str,
+        template_content: str,
+        template_name:    str,
+        session,
+        sid:              str,
+        steps:            list,
+        decision,
+    ) -> CodeResponse:
+        """
+        Full field extraction pipeline:
+        Phase 3 — Template Parsing
+        Phase 4 — LLM Field Extraction
+        Phase 5 — Value Cleaning
+        Phase 6 — Cross-field Consistency
+        Phase 7 — Template Filling
+        Phase 8 — LangSmith Validation
+        """
+        def log(type_: str, msg: str):
+            steps.append(PipelineStep(type=type_, message=msg))
+            logger.info("[%s] %s: %s", sid, type_.upper(), msg)
+
+        def fe_error(reason: str) -> CodeResponse:
+            return CodeResponse(
+                session_id=sid, intent="field_extraction",
+                agent_used="Field Extractor", model_used=field_extraction_agent.model,
+                needs_clarification=False, clarification_message=None,
+                classification_confidence=decision.confidence,
+                classification_gap=decision.confidence - decision.runner_up_confidence,
+                classification_source=decision.source,
+                max_tokens_used=0, temperature_used=0.0,
+                temperature_bounds="[0.0–0.1]",
+                validation_attempts=0, validation_score=None,
+                result=reason, steps=steps, saved_to=None,
+            )
+
+        # ── Phase 3: Template Parsing ─────────────────────────────────────────
+        if not template_content:
+            return fe_error(
+                "No template provided. Please upload a template file using "
+                "/upload and pass its content as 'template_content'."
+            )
+        if not file_content:
+            return fe_error(
+                "No document provided. Please upload a document using "
+                "/upload and pass its content as 'file_content'."
+            )
+
+        log("info", f"Parsing template: {template_name}")
+        fields = template_parser.parse(template_content)
+        if not fields:
+            return fe_error(
+                f"No placeholder fields found in template '{template_name}'. "
+                "Supported formats: {{field_name}}, [FIELD_NAME], __field_name__, <field_name>"
+            )
+        log("info", f"Found {len(fields)} fields: {', '.join(f.name for f in fields)}")
+        for f in fields:
+            log("info", f"  {f.name} → type={f.type}" +
+                (f" pattern={f.pattern}" if f.pattern else "") +
+                (f" constraints={f.constraints}" if f.constraints else ""))
+
+        # ── Phase 4: LLM Field Extraction ─────────────────────────────────────
+        log("info", "Extracting field values from document (single LLM call)...")
+        raw_extracted = field_extraction_agent.extract(file_content, fields)
+        log("info", f"Raw extraction complete: {len([v for v in raw_extracted.values() if v])} values found")
+
+        # ── Phase 5: Value Cleaning & Type Conversion ─────────────────────────
+        log("info", "Cleaning and converting extracted values...")
+        cleaned        = {}
+        field_results  = []
+
+        for f in fields:
+            raw = raw_extracted.get(f.name)
+            cleaned_val, error = value_cleaner.clean(raw, f)
+
+            if raw is None or str(raw).strip().lower() in ('null', 'none', '', 'n/a', 'not found'):
+                status = "not_found"
+            elif error:
+                status = "conversion_error"
+            else:
+                status = "filled"
+                cleaned[f.name] = cleaned_val
+
+            field_results.append({
+                "field":         f.name,
+                "raw_value":     str(raw) if raw is not None else None,
+                "cleaned_value": cleaned_val,
+                "type":          f.type,
+                "status":        status,
+                "grounded":      None,
+                "error":         error,
+            })
+            log(
+                "info" if status == "filled" else "warning",
+                f"  {f.name}: {status}" +
+                (f" → {cleaned_val}" if status == "filled" else "") +
+                (f" (error: {error})" if error else "")
+            )
+
+        # ── Phase 6: Cross-field Consistency ──────────────────────────────────
+        log("info", "Running cross-field consistency checks...")
+        warnings = cross_checker.check(raw_extracted, cleaned, file_content)
+        for w in warnings:
+            log("warning", f"Cross-check: {w}")
+
+        # ── Phase 7: Template Filling ──────────────────────────────────────────
+        log("info", "Filling template with extracted values...")
+        filled_template = template_content
+        for f in fields:
+            value_str   = str(cleaned.get(f.name, "")) if f.name in cleaned else "[NOT FOUND IN DOCUMENT]"
+            # Replace all supported placeholder formats
+            filled_template = filled_template.replace(f"{{{f.name}}}", value_str)
+            filled_template = filled_template.replace(f"[{f.name.upper()}]", value_str)
+            filled_template = filled_template.replace(f"__{f.name}__", value_str)
+            filled_template = filled_template.replace(f"<{f.name}>", value_str)
+
+        # ── Phase 8: LangSmith Validation ────────────────────────────────────
+        log("info", "Validating extraction results (LangSmith)...")
+        val = field_extraction_validator.validate(
+            fields=fields,
+            cleaned=cleaned,
+            field_results=field_results,
+            document=file_content,
+            run_name=f"extraction_{sid[:8]}",
+        )
+
+        log(
+            "success" if val["valid"] else "warning",
+            f"Validation {'PASSED' if val['valid'] else 'FAILED'} "
+            f"(score={val['score']:.3f} | "
+            f"coverage={val['coverage_score']:.2f} "
+            f"grounding={val['grounding_score']:.2f} "
+            f"type={val['type_score']:.2f})"
+        )
+        for fb in val["feedback"]:
+            log("warning", fb)
+
+        # ── Update session ────────────────────────────────────────────────────
+        session.add("user", prompt)
+        session.add("assistant", f"Filled template with {len(cleaned)}/{len(fields)} fields.")
+
+        return CodeResponse(
+            session_id=sid,
+            intent="field_extraction",
+            agent_used=field_extraction_agent.name,
+            model_used=field_extraction_agent.model,
+            needs_clarification=False,
+            clarification_message=None,
+            classification_confidence=decision.confidence,
+            classification_gap=decision.confidence - decision.runner_up_confidence,
+            classification_source=decision.source,
+            max_tokens_used=1024,
+            temperature_used=field_extraction_agent.temp_default,
+            temperature_bounds=f"[{field_extraction_agent.temp_min}–{field_extraction_agent.temp_max}]",
+            validation_attempts=1,
+            validation_score=val["score"],
+            result=filled_template,
+            steps=steps,
+            saved_to=None,
+            # Field extraction specific
+            field_results=[FieldResult(**r) for r in field_results],
+            coverage_score=val["coverage_score"],
+            grounding_score=val["grounding_score"],
+            type_score=val["type_score"],
+            missing_fields=val["missing_fields"],
+            warnings=warnings + val["feedback"],
+            validation_passed=val["valid"],
+        )
 
     @staticmethod
     def _save(code: str, file_name: Optional[str]) -> Optional[str]:

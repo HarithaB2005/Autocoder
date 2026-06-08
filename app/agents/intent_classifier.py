@@ -91,6 +91,15 @@ INTENT_DEFINITIONS: dict[str, list[str]] = {
         "extract file paths and configurations",
         "analyze the project structure and dependencies",
     ],
+    "field_extraction": [
+        "fill this template using information from the document",
+        "extract fields from document and populate the form",
+        "find values in this document and fill the template",
+        "populate this form with data extracted from the file",
+        "read the document and fill in the template fields",
+        "extract and fill all placeholder fields from the document",
+        "use the document to complete this form template",
+    ],
     "generation": [
         "write a Python function that does this",
         "generate code for a REST API",
@@ -151,7 +160,7 @@ class IntentClassifier:
         # certainly means the user wants to do something with the code.
         # Re-route to the highest-scoring code intent instead.
         if has_file and best_intent == "general_chat":
-            code_intents = {"debugging", "refactoring", "explanation", "generation", "metadata_extraction"}
+            code_intents = {"debugging", "refactoring", "explanation", "generation", "metadata_extraction", "field_extraction"}
             for intent, score in scored:
                 if intent in code_intents:
                     best_intent   = intent
@@ -199,6 +208,7 @@ class IntentClassifier:
             "explanation":         "get an explanation of how something works",
             "metadata_extraction": "extract metadata or dependencies from a project",
             "generation":          "generate new code from scratch",
+            "field_extraction":    "extract fields from a document and fill a template",
         }
 
         file_hint    = "I can see you've attached a file. " if has_file else ""

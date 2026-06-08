@@ -11,7 +11,7 @@ What clients CAN control:
 """
 
 from __future__ import annotations
-from typing import Optional, List, Literal
+from typing import Any, Optional, List, Literal
 from pydantic import BaseModel, Field
 
 
@@ -36,6 +36,23 @@ class CodeRequest(BaseModel):
         description="Original filename (used for output naming and language hints).",
         examples=["main.py"],
     )
+
+    # ── Template fields (for field_extraction intent) ─────────────────────────
+    template_content: Optional[str] = Field(
+        None,
+        max_length=500_000,
+        description=(
+            "Template text containing placeholders like {field_name}, [FIELD], "
+            "or __field__. Used with file_content for field extraction tasks. "
+            "Get this value from the /upload endpoint."
+        ),
+    )
+    template_name: Optional[str] = Field(
+        None,
+        max_length=255,
+        description="Original template filename.",
+        examples=["form_template.txt"],
+    )
     session_id: Optional[str] = Field(
         None,
         max_length=128,
@@ -59,6 +76,18 @@ class CodeRequest(BaseModel):
             "Range: 0 (skip validation) – 7. Defaults to server setting (3)."
         ),
     )
+
+
+# ─── Field Extraction ─────────────────────────────────────────────────────────
+
+class FieldResult(BaseModel):
+    field:         str
+    raw_value:     Optional[str]   = None
+    cleaned_value: Optional[Any]   = None
+    type:          str             = "text"
+    status:        str             = "not_found"   # filled | not_found | conversion_error
+    grounded:      Optional[bool]  = None
+    error:         Optional[str]   = None
 
 
 # ─── Response ─────────────────────────────────────────────────────────────────
@@ -92,6 +121,15 @@ class CodeResponse(BaseModel):
     result:   str
     steps:    List[PipelineStep]
     saved_to: Optional[str] = None
+
+    # ── Field extraction results (populated only for field_extraction intent) ─
+    field_results:    Optional[List[FieldResult]] = None
+    coverage_score:   Optional[float]             = None
+    grounding_score:  Optional[float]             = None
+    type_score:       Optional[float]             = None
+    missing_fields:   Optional[List[str]]         = None
+    warnings:         Optional[List[str]]         = None
+    validation_passed: Optional[bool]             = None
 
 
 # ─── Session ──────────────────────────────────────────────────────────────────

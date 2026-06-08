@@ -715,3 +715,565 @@ AGENT_REGISTRY: dict[str, BaseAgent] = {
 }
 
 VALIDATION_AGENT = ValidationAgent()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FIELD EXTRACTION — TemplateParser, ValueCleaner, FieldExtractionAgent,
+#                    FieldExtractionValidator (LangSmith-powered)
+# Zero changes to existing agents above.
+# ═════════════════════════════════════════════════════════════════════════════
+
+import re as _re
+import os as _os
+from dataclasses import dataclass, field as dc_field
+from typing import Any, Dict, List
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TemplateField dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TemplateField:
+    name:        str
+    type:        str            # text|integer|float|currency|date|email|phone|pattern
+    pattern:     str  = ""      # regex string for pattern types
+    unit:        str  = ""      # ₹, $, %, years etc.
+    constraints: Dict = dc_field(default_factory=dict)  # {min, max}
+    required:    bool = True
+    placeholder: str  = ""      # original placeholder found in template e.g. {first_name}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TemplateParser — pure regex, no LLM, free
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TemplateParser:
+    """
+    Scans template text for placeholder patterns and infers field types
+    from field names using regex heuristics.
+    Supports: {field}, [FIELD], __field__, <field>
+    """
+
+    PLACEHOLDER_PATTERNS = [
+        _re.compile(r'\{(\w+)\}'),          # {first_name}
+        _re.compile(r'\[([A-Z_]+)\]'),      # [FIRST_NAME]
+        _re.compile(r'__(\w+)__'),          # __first_name__
+        _re.compile(r'<(\w+)>'),            # <first_name>
+    ]
+
+    FIELD_TYPE_RULES: List[tuple] = [
+        # (regex on lowercase field name, type, extra)
+        (_re.compile(r'income|salary|amount|price|cost|fee|revenue|balance|payment'), 'currency', {}),
+        (_re.compile(r'date|dob|born|expiry|issued|joining|since'),                   'date',     {}),
+        (_re.compile(r'email|mail'),                                                   'email',    {}),
+        (_re.compile(r'phone|mobile|contact|fax|tel'),                                'phone',    {}),
+        (_re.compile(r'pan$|pan_'),                                                    'pattern',  {'pattern': r'^[A-Z]{5}[0-9]{4}[A-Z]$'}),
+        (_re.compile(r'aadhaar|aadhar'),                                               'pattern',  {'pattern': r'^\d{12}$'}),
+        (_re.compile(r'ifsc'),                                                         'pattern',  {'pattern': r'^[A-Z]{4}0[A-Z0-9]{6}$'}),
+        (_re.compile(r'pincode|zipcode|postal'),                                       'pattern',  {'pattern': r'^\d{6}$'}),
+        (_re.compile(r'passport'),                                                     'pattern',  {'pattern': r'^[A-Z][0-9]{7}$'}),
+        (_re.compile(r'gst'),                                                          'pattern',  {'pattern': r'^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$'}),
+        (_re.compile(r'age$|^age_|_age$'),                                             'integer',  {'constraints': {'min': 0, 'max': 150}}),
+        (_re.compile(r'count|quantity|number|id$|tenure|year|month|day'),              'integer',  {}),
+        (_re.compile(r'percent|rate|score|ratio|gpa|percentage'),                      'float',    {'constraints': {'min': 0.0, 'max': 100.0}}),
+        (_re.compile(r'name|first|last|middle|full|street|city|state|country|'
+                     r'address|description|remarks|purpose|notes|comment|'
+                     r'occupation|employer|designation|nationality'),                  'text',     {}),
+    ]
+
+    def parse(self, template_text: str) -> List[TemplateField]:
+        """Extract all placeholder fields from template and infer their types."""
+        seen   = set()
+        fields = []
+
+        for pat in self.PLACEHOLDER_PATTERNS:
+            for match in pat.finditer(template_text):
+                raw_name = match.group(1)
+                name     = raw_name.lower().strip()
+                if name in seen:
+                    continue
+                seen.add(name)
+                ftype, extra = self._infer_type(name)
+                fields.append(TemplateField(
+                    name=name,
+                    type=ftype,
+                    pattern=extra.get('pattern', ''),
+                    unit=extra.get('unit', ''),
+                    constraints=extra.get('constraints', {}),
+                    required=True,
+                    placeholder=match.group(0),
+                ))
+
+        return fields
+
+    def _infer_type(self, name: str) -> tuple:
+        for rule_re, ftype, extra in self.FIELD_TYPE_RULES:
+            if rule_re.search(name):
+                return ftype, extra
+        return 'text', {}
+
+
+template_parser = TemplateParser()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ValueCleaner — pure Python, no LLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ValueCleaner:
+    """
+    Converts raw LLM-extracted strings into typed Python values.
+    Returns (cleaned_value, error_message_or_None).
+    """
+
+    def clean(self, raw: Any, field: TemplateField) -> tuple:
+        if raw is None or str(raw).strip().lower() in ('null', 'none', '', 'n/a', 'not found'):
+            return None, None  # legitimately missing
+
+        raw_str = str(raw).strip()
+        try:
+            if field.type == 'text':        return self._text(raw_str, field),     None
+            if field.type == 'integer':     return self._integer(raw_str, field),  None
+            if field.type == 'float':       return self._float(raw_str, field),    None
+            if field.type == 'currency':    return self._currency(raw_str),        None
+            if field.type == 'date':        return self._date(raw_str),            None
+            if field.type == 'email':       return self._email(raw_str),           None
+            if field.type == 'phone':       return self._phone(raw_str),           None
+            if field.type == 'pattern':     return self._pattern(raw_str, field),  None
+            return raw_str, None
+        except Exception as e:
+            return None, str(e)
+
+    # ── type converters ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _text(s: str, field: TemplateField) -> str:
+        cleaned = s.strip()
+        # Title-case only for name fields
+        if any(w in field.name for w in ('name', 'first', 'last', 'middle', 'full')):
+            cleaned = cleaned.title()
+        return cleaned
+
+    @staticmethod
+    def _integer(s: str, field: TemplateField) -> int:
+        digits = _re.sub(r'[^\d-]', '', s)
+        if not digits:
+            raise ValueError(f"Cannot extract integer from '{s}'")
+        val = int(digits)
+        mn  = field.constraints.get('min')
+        mx  = field.constraints.get('max')
+        if mn is not None and val < mn:
+            raise ValueError(f"{val} is below minimum {mn}")
+        if mx is not None and val > mx:
+            raise ValueError(f"{val} exceeds maximum {mx}")
+        return val
+
+    @staticmethod
+    def _float(s: str, field: TemplateField) -> float:
+        cleaned = _re.sub(r'[^\d.\-]', '', s.replace(',', ''))
+        if not cleaned:
+            raise ValueError(f"Cannot extract float from '{s}'")
+        val = float(cleaned)
+        mn  = field.constraints.get('min')
+        mx  = field.constraints.get('max')
+        if mn is not None and val < mn:
+            raise ValueError(f"{val} is below minimum {mn}")
+        if mx is not None and val > mx:
+            raise ValueError(f"{val} exceeds maximum {mx}")
+        return val
+
+    @staticmethod
+    def _currency(s: str) -> float:
+        # Strip currency symbols, commas, and text like "per year"
+        cleaned = _re.sub(r'[₹$€£¥]', '', s)
+        cleaned = _re.sub(r'(?i)(per\s+year|per\s+month|per\s+annum|p\.a\.?|lakh|crore)', '', cleaned)
+        cleaned = cleaned.replace(',', '').strip()
+        num_match = _re.search(r'[\d.]+', cleaned)
+        if not num_match:
+            raise ValueError(f"Cannot extract currency value from '{s}'")
+        base = float(num_match.group())
+        # Handle lakh/crore suffixes before stripping
+        if _re.search(r'(?i)lakh', s):
+            base *= 100_000
+        elif _re.search(r'(?i)crore', s):
+            base *= 10_000_000
+        return base
+
+    @staticmethod
+    def _date(s: str) -> str:
+        try:
+            from dateutil import parser as _dp
+            dt = _dp.parse(s, dayfirst=True)
+            return dt.strftime('%Y-%m-%d')
+        except Exception:
+            raise ValueError(f"Cannot parse date from '{s}'")
+
+    @staticmethod
+    def _email(s: str) -> str:
+        cleaned = s.lower().strip()
+        if '@' not in cleaned or '.' not in cleaned:
+            raise ValueError(f"'{s}' does not look like a valid email")
+        return cleaned
+
+    @staticmethod
+    def _phone(s: str) -> str:
+        digits = _re.sub(r'[^\d+]', '', s)
+        # Normalise Indian numbers
+        if digits.startswith('0') and len(digits) == 11:
+            digits = '+91' + digits[1:]
+        elif len(digits) == 10 and not digits.startswith('+'):
+            digits = '+91' + digits
+        return digits
+
+    @staticmethod
+    def _pattern(s: str, field: TemplateField) -> str:
+        cleaned = s.replace(' ', '').upper()
+        if field.pattern and not _re.match(field.pattern, cleaned):
+            raise ValueError(
+                f"'{cleaned}' does not match required format {field.pattern}"
+            )
+        return cleaned
+
+
+value_cleaner = ValueCleaner()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FieldExtractionAgent — uses LLM for extraction only
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FieldExtractionAgent(BaseAgent):
+    name         = "Field Extractor"
+    model        = "gemma-2-9b"       # Gemma: best structured JSON output
+    temp_default = 0.05
+    temp_min     = 0.0
+    temp_max     = 0.1
+    role_prompt  = textwrap.dedent("""\
+        You are a precise document field extraction engine.
+        STRICT RULES:
+        1. Extract ONLY values explicitly present in the document.
+        2. Do NOT infer, guess, or hallucinate values.
+        3. Return ONLY valid JSON — no prose, no markdown fences, no trailing commas.
+        4. If a value is not found return null for that field.
+        5. For name fields: extract the value labelled for that specific field,
+           not the nearest name. first_name and last_name are different fields.\
+    """)
+
+    def extract(self, document: str, fields: List[TemplateField]) -> Dict:
+        """Send all fields in one LLM call. Returns raw extraction dict."""
+        field_descriptions = []
+        for f in fields:
+            desc = f"- {f.name} (type: {f.type}"
+            if f.type == 'text' and 'name' in f.name:
+                if 'first' in f.name:
+                    desc += " — person's given/personal name, NOT family name"
+                elif 'last' in f.name or 'surname' in f.name:
+                    desc += " — person's family/surname, NOT first/given name"
+            if f.pattern:
+                desc += f", format: {f.pattern}"
+            if f.constraints:
+                if 'min' in f.constraints: desc += f", min: {f.constraints['min']}"
+                if 'max' in f.constraints: desc += f", max: {f.constraints['max']}"
+            desc += ")"
+            field_descriptions.append(desc)
+
+        fields_str  = "\n".join(field_descriptions)
+        field_names = ", ".join(f'"{f.name}": null' for f in fields)
+
+        prompt = textwrap.dedent(f"""\
+            {self.role_prompt}
+
+            DOCUMENT:
+            {document}
+
+            Extract these fields from the document above:
+            {fields_str}
+
+            Return ONLY this JSON structure with extracted values (null if not found):
+            {{{field_names}}}
+        """)
+
+        response = registry.generate(
+            model_name=self.model,
+            prompt=prompt,
+            max_tokens=1024,
+            temperature=self.temp_default,
+        )
+
+        # Parse JSON from response
+        try:
+            # Strip markdown fences if present
+            clean = _re.sub(r'```(?:json)?\s*|\s*```', '', response).strip()
+            return json.loads(clean)
+        except Exception:
+            # Attempt partial extraction via regex
+            result = {}
+            for f in fields:
+                m = _re.search(
+                    rf'["\']?{_re.escape(f.name)}["\']?\s*:\s*(["\']?)([^,\n\}}]+)\1',
+                    response
+                )
+                result[f.name] = m.group(2).strip() if m else None
+            return result
+
+
+field_extraction_agent = FieldExtractionAgent()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CrossFieldChecker — pure logic, no LLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CrossFieldChecker:
+    """Checks name swaps and age/DOB contradictions."""
+
+    def check(
+        self,
+        extracted:  Dict,
+        cleaned:    Dict,
+        document:   str,
+    ) -> List[str]:
+        warnings = []
+
+        # ── Name swap detection ───────────────────────────────────────────────
+        fn = cleaned.get('first_name') or cleaned.get('firstname')
+        ln = cleaned.get('last_name')  or cleaned.get('lastname') or cleaned.get('surname')
+        if fn and ln:
+            doc_lower  = document.lower()
+            correct    = f"{fn} {ln}".lower()
+            swapped    = f"{ln} {fn}".lower()
+
+            # Check combined name patterns
+            combined_swap    = swapped in doc_lower and correct not in doc_lower
+            # Check label-based patterns: "First Name: Smith" when fn=Smith is wrong
+            label_first_swap = bool(
+                _re.search(rf'first\s*name\s*[:\-]\s*{_re.escape(ln.lower())}', doc_lower) and
+                _re.search(rf'last\s*name\s*[:\-]\s*{_re.escape(fn.lower())}', doc_lower)
+            )
+
+            if combined_swap or label_first_swap:
+                warnings.append(
+                    f"first_name and last_name appear swapped — "
+                    f"auto-corrected: first_name='{ln}', last_name='{fn}'"
+                )
+                # Auto-correct
+                if 'first_name' in cleaned: cleaned['first_name'] = ln
+                if 'firstname'  in cleaned: cleaned['firstname']  = ln
+                if 'last_name'  in cleaned: cleaned['last_name']  = fn
+                if 'lastname'   in cleaned: cleaned['lastname']   = fn
+                if 'surname'    in cleaned: cleaned['surname']    = fn
+
+        # ── Age vs DOB contradiction ──────────────────────────────────────────
+        age = cleaned.get('age')
+        dob = cleaned.get('dob') or cleaned.get('date_of_birth') or cleaned.get('birthdate')
+        if age is not None and dob is not None:
+            try:
+                from datetime import date
+                from dateutil import parser as _dp
+                born         = _dp.parse(dob)
+                today        = date.today()
+                expected_age = today.year - born.year - (
+                    (today.month, today.day) < (born.month, born.day)
+                )
+                if abs(expected_age - int(age)) > 1:
+                    warnings.append(
+                        f"age={age} contradicts dob={dob} "
+                        f"(expected ~{expected_age}) — trusting DOB, recalculating age"
+                    )
+                    if 'age' in cleaned:
+                        cleaned['age'] = expected_age
+            except Exception:
+                pass
+
+        return warnings
+
+
+cross_checker = CrossFieldChecker()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FieldExtractionValidator — LangSmith-powered semantic + structural validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FieldExtractionValidator:
+    """
+    3-phase validator for field extraction:
+      Phase 1 — Coverage  : required fields filled?         (weight 35%)
+      Phase 2 — Grounding : values traceable to document?   (weight 45%)
+      Phase 3 — Type      : all type conversions passed?    (weight 20%)
+
+    LangSmith traces every validation run when LANGSMITH_API_KEY is set.
+    Falls back gracefully to local scoring if LangSmith is unavailable.
+
+    PASS threshold: 0.80
+    """
+
+    PASS_THRESHOLD   = 0.80
+    COVERAGE_WEIGHT  = 0.35
+    GROUNDING_WEIGHT = 0.45
+    TYPE_WEIGHT      = 0.20
+
+    def validate(
+        self,
+        fields:        List[TemplateField],
+        cleaned:       Dict,
+        field_results: List[Dict],
+        document:      str,
+        run_name:      str = "field_extraction_validation",
+    ) -> Dict:
+        """
+        Returns:
+        {
+          "valid": bool, "score": float,
+          "coverage_score": float, "grounding_score": float, "type_score": float,
+          "feedback": list[str], "missing_fields": list[str]
+        }
+        """
+        # ── Try LangSmith tracing ─────────────────────────────────────────────
+        langsmith_client = self._get_langsmith_client()
+        run_id           = None
+
+        if langsmith_client:
+            try:
+                import uuid as _uuid
+                run_id = str(_uuid.uuid4())
+                langsmith_client.create_run(
+                    id=run_id,
+                    name=run_name,
+                    run_type="chain",
+                    inputs={
+                        "fields":    [f.name for f in fields],
+                        "extracted": cleaned,
+                    },
+                )
+            except Exception as e:
+                logger.warning("LangSmith run creation failed: %s", e)
+                run_id = None
+
+        # ── Run all 3 phases ──────────────────────────────────────────────────
+        coverage_score,  missing,   coverage_fb  = self._coverage(fields, cleaned)
+        grounding_score, grounding_fb             = self._grounding(field_results, document)
+        type_score,      type_fb                  = self._type_correctness(field_results)
+
+        score    = (
+            coverage_score  * self.COVERAGE_WEIGHT  +
+            grounding_score * self.GROUNDING_WEIGHT +
+            type_score      * self.TYPE_WEIGHT
+        )
+        valid    = score >= self.PASS_THRESHOLD
+        feedback = coverage_fb + grounding_fb + type_fb
+
+        result = {
+            "valid":           valid,
+            "score":           round(score, 3),
+            "coverage_score":  round(coverage_score, 3),
+            "grounding_score": round(grounding_score, 3),
+            "type_score":      round(type_score, 3),
+            "feedback":        feedback,
+            "missing_fields":  missing,
+        }
+
+        # ── Post result to LangSmith ──────────────────────────────────────────
+        if langsmith_client and run_id:
+            try:
+                langsmith_client.update_run(
+                    run_id=run_id,
+                    outputs=result,
+                    end_time=__import__('datetime').datetime.utcnow(),
+                )
+                # Log per-field scores as feedback
+                for fr in field_results:
+                    if fr.get('status') == 'filled':
+                        langsmith_client.create_feedback(
+                            run_id=run_id,
+                            key=f"field_{fr['field']}_grounded",
+                            score=1.0 if fr.get('grounded') else 0.0,
+                        )
+            except Exception as e:
+                logger.warning("LangSmith update failed: %s", e)
+
+        logger.info(
+            "[FieldValidator] score=%.3f (cov=%.2f gnd=%.2f typ=%.2f) → %s",
+            score, coverage_score, grounding_score, type_score,
+            "PASS" if valid else "FAIL",
+        )
+        return result
+
+    # ── Phase helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _coverage(fields: List[TemplateField], cleaned: Dict) -> tuple:
+        required = [f for f in fields if f.required]
+        if not required:
+            return 1.0, [], []
+        missing  = [f.name for f in required if not cleaned.get(f.name)]
+        filled   = len(required) - len(missing)
+        score    = filled / len(required)
+        fb       = [f"Required field '{m}' not found in document" for m in missing]
+        return score, missing, fb
+
+    @staticmethod
+    def _grounding(field_results: List[Dict], document: str) -> tuple:
+        filled = [r for r in field_results if r.get('status') == 'filled']
+        if not filled:
+            return 1.0, []
+        doc_lower = document.lower()
+        grounded  = 0
+        fb        = []
+        for r in filled:
+            raw = str(r.get('raw_value') or '').lower().strip()
+            if not raw:
+                continue
+            # Check raw value or significant part of it exists in document
+            # For currency: check the numeric portion
+            if r.get('type') == 'currency':
+                nums = _re.findall(r'\d+', raw)
+                found = any(n in doc_lower for n in nums if len(n) > 2)
+            else:
+                found = raw in doc_lower or (len(raw) > 4 and raw[:6] in doc_lower)
+            if found:
+                grounded += 1
+                r['grounded'] = True
+            else:
+                fb.append(
+                    f"Field '{r['field']}': extracted value '{r['raw_value']}' "
+                    f"not traceable to document — possible hallucination"
+                )
+                r['grounded'] = False
+        score = grounded / len(filled) if filled else 1.0
+        return score, fb
+
+    @staticmethod
+    def _type_correctness(field_results: List[Dict]) -> tuple:
+        filled = [r for r in field_results if r.get('status') == 'filled']
+        if not filled:
+            return 1.0, []
+        correct = sum(1 for r in filled if not r.get('error'))
+        fb      = [
+            f"Field '{r['field']}': type error — {r['error']}"
+            for r in filled if r.get('error')
+        ]
+        return correct / len(filled), fb
+
+    @staticmethod
+    def _get_langsmith_client():
+        """Return LangSmith client if configured, else None."""
+        api_key = _os.environ.get('LANGSMITH_API_KEY')
+        if not api_key:
+            return None
+        try:
+            from langsmith import Client
+            return Client(api_key=api_key)
+        except ImportError:
+            logger.warning(
+                "langsmith package not installed — "
+                "run 'pip install langsmith' to enable LangSmith tracing."
+            )
+            return None
+        except Exception as e:
+            logger.warning("LangSmith client init failed: %s", e)
+            return None
+
+
+field_extraction_validator = FieldExtractionValidator()
