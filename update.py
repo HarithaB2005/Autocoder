@@ -1,131 +1,20 @@
-AI chatbots like ChatGPT and Gemini do not actually "think" or "search" through previous chats. Instead, the interface secretly bundles up your entire conversation history and resends it to the AI as one long script every single time you type a new message. [1, 2, 3, 4, 5] 
-## The Engine Behind the Memory: How It Works
+You are an expert Software Tester. I need you to write a Python function called `generate_intelligent_tests(user_prompt: str, generated_code: str) -> str`. 
 
-* The "Tape Recorder" Effect: Every prompt you send and every response the AI generates is added to a rolling log.
-* Role-Based Formatting: The application backend tags the text so the AI knows who said what (e.g., User: Generate code, Assistant: Here is the code).
-* Why the AI "Finds" the Right Turn: Because the entire history is sent as context, the AI reads the whole conversation chronologically. When you say "debug the code," it reads the script up to that point, sees the code it provided in the previous turn, and targets it for debugging. [1, 6, 7, 8] 
+This function must invoke our LLM to analyze the generated code code block and dynamically produce a highly relevant python test suite using standard 'assert' statements. 
 
-## How Platforms Handle Complex or Long Chats
-To prevent the system from slowing down or crashing, platforms use advanced management techniques:
+The system prompt inside this function must tell the LLM to follow these instructions precisely:
 
-* Context Windows: Modern AI models can process massive amounts of text at once. If your script gets too long, older information may be dropped, but your most recent exchanges are always highly prioritized. [9, 10] 
-* Smart Compression: To save memory, the platform's background code might dynamically condense older turns into brief summaries while keeping the exact, recent code exchanges intact. [11, 12] 
-* Cross-Chat Memory: Both ChatGPT (Plus/Pro models) and Gemini have "Saved Memory" features. They extract key concepts from a thread and store them in a background profile, so the AI will remember preferences or project constraints even when you start an entirely new chat. [13, 14, 15, 16, 17] 
+1. DYNAMIC INPUT PARAMETER MATCHING:
+   - Carefully inspect the exact code snippet provided in `generated_code`.
+   - Identify how the code expects inputs to be delivered (e.g., look at the specific function or method parameters, keyword arguments, and data types).
+   - Generate test inputs that rigidly match those parameter signatures. Do not guess parameters or introduce variables that do not exist in the code structure.
 
-If your goal is to organize complex tasks, are you currently hitting limits with a specific coding project, or are you looking to understand how to manage long chat histories without losing track of your work? Let me know how you'd like to proceed!
+2. BALANCED TEST CONDITION GENERATION:
+   - Happy Path: Generate 2-3 standard test inputs based on the intent of the original `user_prompt` to check that the code works correctly under normal conditions.
+   - Edge Cases: Generate test inputs that stress-test those exact parameters using extreme values, empty strings, nulls, or empty collections (`None`, `[]`, `{}`) depending on what data type the parameter expects.
 
-[1] [https://purohitpavan.medium.com](https://purohitpavan.medium.com/chronicles-of-the-promptmind-29c9a6aff120)
-[2] [https://embracethered.com](https://embracethered.com/blog/posts/2025/chatgpt-how-does-chat-history-memory-preferences-work/)
-[3] [https://www.mindfiretechnology.com](https://www.mindfiretechnology.com/blog/archive/getting-started-with-the-google-gemini-api/)
-[4] [https://www.reddit.com](https://www.reddit.com/r/Bard/comments/1hn4vkc/is_there_a_search_within_past_chat_threads_in/)
-[5] [https://medium.com](https://medium.com/@acevisuals.business/chatgpt-isnt-the-issue-your-prompts-are-fix-them-like-a-pro-4e52b32df939)
-[6] [https://www.youtube.com](https://www.youtube.com/watch?v=QP3LVUZqyuk)
-[7] [https://askfilo.com](https://askfilo.com/user-question-answers-smart-solutions/in-a-multi-turn-conversation-how-does-chatgpt-maintain-3231383032363932)
-[8] [https://medium.com](https://medium.com/fundamentals-of-artificial-intelligence/langchain-memory-286b350df211)
-[9] [https://www.ibm.com](https://www.ibm.com/think/topics/context-window)
-[10] [https://www.instagram.com](https://www.instagram.com/reel/DVYhPvnjrws/)
-[11] [https://medium.com](https://medium.com/javarevisited/day-24-%EF%B8%8F-multi-turn-conversations-managing-session-context-in-java-e21d7b290c39)
-[12] [https://medium.com](https://medium.com/genai-llms/chat-history-long-term-memory-how-chatgpt-uses-context-957182526c6e)
-[13] [https://blog.google](https://blog.google/feed/gemini-referencing-past-chats/)
-[14] [https://ziptie.dev](https://ziptie.dev/blog/how-ai-remembers-your-content-across-sessions/)
-[15] [https://help.openai.com](https://help.openai.com/articles/8590148-memory-faq)
-[16] [https://www.yahoo.com](https://www.yahoo.com/tech/google-gemini-just-got-memory-215751623.html)
-[17] [https://memeburn.com](https://memeburn.com/chatgpt-vs-gemini/)
+3. OUTPUT FORMAT:
+   - Output PURE executable python code enclosed in markdown code blocks (```python ... ```). 
+   - Do not include any conversational introductions, markdown explanations, or descriptions outside the code block.
 
-
-Yes. If you want a simple fix that requires zero backend database changes and zero extra code, you can solve this purely by tweaking your system prompt and the way you feed variables into it.
-Here are the three easiest ways to fix this instantly:
-## 1. The Simplest Fix: Just Lower the Priority in the Prompt
-You don't need to delete the last_output variable if your backend depends on it. Instead, change how you describe it to the AI. Right now, your prompt tells the AI it is the "highest priority," which blinds it to the past.
-Change your final prompt template to look like this:
-
-[System Instructions]
-You are Auto Coder.
-
-[Conversation History]
-{chat_history} (Contains the last 10 messages)
-
-[Reference Context]
-The text below is just a quick reference of the immediate last output:
-{last_output}
-
-[User Prompt]
-{user_message}
-
-[Instruction]
-Do not look only at the Reference Context. If the user asks to debug, modify, or explain code, look backward through the entire [Conversation History] to find the code they are talking about.
-
-## 2. The "Window Expansion" Trick (No Code Changes)
-If your backend is currently coded to grab only the last_output as a special variable, change that variable's definition in your code to grab the last 3 outputs instead of just 1.
-
-* Call the variable {recent_outputs} instead of {last_output}.
-* Feed the last 3 bot responses into it.
-* This ensures that even if the last turn was just text, the code from two turns ago is automatically included in that "high priority" box.
-
-## 3. Add a "History Scan" Rule to Your System Prompt
-Keep your current setup exactly as it is, but add this specific block of text to your main system instructions:
-
-CRITICAL RULE FOR CODE CONTEXT:
-When the user asks to "debug," "fix," or "change" the code, the code might not be in the last_output variable. It may be 2 or 3 turns back in the conversation history. You MUST read the full conversational history provided to locate the code block before responding.
-
-## Summary of What to Do Right Now
-
-   1. Do not change your database.
-   2. Do not write code to tag or separate messages.
-   3. Simply update your system prompt text to tell the AI: "Hey, the last output is just for reference. The actual code you need to fix might be a few messages back in the history, so look there." Because LLMs are smart, this simple instruction is usually enough to fix the tracking issue.
-
-Would you like to share the exact text of your current system prompt? I can rewrite it for you right now to include these instructions safely.
-
-
-You are an expert software engineer. I need you to help me refactor my chatbot's user profiling system. 
-
-CURRENT STATE (TO BE REMOVED):
-We currently have a static 'persona.md' where users manually toggle settings in the frontend UI (e.g., choosing if the AI is a 'helpful assistant'). We need to completely deprecate and remove this UI-driven system.
-
-NEW STATE (TO BE IMPLEMENTED):
-We want to build a dynamic, background-driven 'persona.md' file that profiles the USER based on their historical queries. The chatbot will tailor its code generation style based on this file.
-
-Please write the logic/code to implement the following pipeline:
-
-1. THE 'persona.md' STRUCTURE:
-Design a markdown schema for 'persona.md' that contains:
-- Technical Skill Level: (e.g., Beginner, Intermediate, Senior Architect)
-- Preferred Stack/Languages: (e.g., Python/FastAPI, TypeScript/Next.js)
-- Coding Style Preferences: (e.g., Verbose with comments, ultra-minimalist, functional, OOP)
-- Domain/Project Focus: (e.g., Building a SaaS, data science, game dev)
-- Behavioral Traits: (e.g., Asks for deep explanations vs. just wants raw code)
-
-2. BACKGROUND RE-PROFILING LOGIC:
-Write a background function or prompt utility that:
-- Periodically scans the user's past 10-20 queries.
-- Extracts patterns (e.g., If the user asks 'what is an array', set level to Beginner. If they ask about 'Kubernetes orchestration scalability', set to Advanced/Architect).
-- Rewrites/updates the 'persona.md' file locally or in the DB without user intervention.
-
-3. CONTEXT INJECTION LOGIC:
-Show me how to read this 'persona.md' file and inject it into our main system prompt payload. It should be passed to the LLM like this:
-"CRITICAL USER CONTEXT: You are generating code for a user with the following profile: [Insert data from persona.md]. Tailor your explanations, code complexity, and brevity to perfectly match this profile."
-
-Please provide the step-by-step implementation, any required helper functions (e.g., in Python or TypeScript depending on my backend), and the precise prompt template to use for the 'Profile Updater' AI agent.
-
-
-
-You are an expert software engineer. I need your help to fix the logging system in my chatbot backend.
-
-CURRENT ISSUE:
-Right now, my application is writing logs to a 'logs/' folder, but it is only saving explicit, manually written log statements or stream logs. Many things that print directly to my terminal—such as framework logs, third-party library printouts, system warnings, and error tracebacks—are missing from the log files. 
-
-GOAL:
-I want to capture absolutely EVERYTHING that appears in the terminal and mirror it directly into a file inside the 'logs/' folder. Nothing should be lost.
-
-Please provide the code and configuration to achieve this:
-
-1. GLOBAL STREAM REDIRECTION:
-Show me how to intercept and redirect both 'sys.stdout' (standard output) and 'sys.stderr' (standard errors/exceptions) so that whatever prints to the terminal is also automatically appended to a log file (e.g., 'logs/app.log').
-
-2. FRAMEWORK LOG CATCH-ALL:
-Ensure that any internal logging from our web framework (like FastAPI, Flask, or Express/Node.js) is also caught by this system and routed to the same folder.
-
-3. DUAL-OUTPUT (STREAM + FILE):
-The logs must still print to the terminal screen in real-time so I can see them while developing, but a perfect mirror copy must be written to the file.
-
-Please provide a clean, production-ready setup script or middleware that I can import at the very top entry point of my application (e.g., 'main.py' or 'app.js') to fix this instantly.
+Please provide the python function wrapper, the clean internal LLM prompt string template, and the parsing logic to extract the raw test code cleanly for the execution sandbox.
